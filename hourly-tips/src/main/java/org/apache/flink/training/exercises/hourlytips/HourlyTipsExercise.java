@@ -19,15 +19,22 @@
 package org.apache.flink.training.exercises.hourlytips;
 
 import org.apache.flink.api.common.JobExecutionResult;
+import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+import org.apache.flink.api.common.typeinfo.Types;
 import org.apache.flink.api.java.tuple.Tuple3;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.sink.PrintSinkFunction;
 import org.apache.flink.streaming.api.functions.sink.SinkFunction;
 import org.apache.flink.streaming.api.functions.source.SourceFunction;
+import org.apache.flink.streaming.api.functions.windowing.ProcessWindowFunction;
+import org.apache.flink.streaming.api.windowing.assigners.TumblingEventTimeWindows;
+import org.apache.flink.streaming.api.windowing.time.Time;
+import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
+import org.apache.flink.training.exercises.common.datatypes.DriverFaresByHour;
 import org.apache.flink.training.exercises.common.datatypes.TaxiFare;
 import org.apache.flink.training.exercises.common.sources.TaxiFareGenerator;
-import org.apache.flink.training.exercises.common.utils.MissingSolutionException;
+import org.apache.flink.util.Collector;
 
 /**
  * The Hourly Tips exercise from the Flink training.
@@ -71,23 +78,45 @@ public class HourlyTipsExercise {
 
         // set up streaming execution environment
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        WatermarkStrategy<TaxiFare> watermarkStrategy = WatermarkStrategy
+                .<TaxiFare>forMonotonousTimestamps()
+                .withTimestampAssigner((fare, timestamp) -> fare.getEventTimeMillis());
 
         // start the data generator
-        DataStream<TaxiFare> fares = env.addSource(source);
+        DataStream<TaxiFare> fares = env.addSource(source).assignTimestampsAndWatermarks(watermarkStrategy);
 
-        // replace this with your solution
-        if (true) {
-            throw new MissingSolutionException();
-        }
+        // compute driver fares per hour
+        DataStream<DriverFaresByHour> driverFaresByHour = fares
+                .map(f -> new DriverFaresByHour(f.driverId, f.tip))
+                .keyBy(d -> d.driverId)
+                .window(TumblingEventTimeWindows.of(Time.hours(1)))
+                .reduce((f1, f2) -> new DriverFaresByHour(f1.driverId, f1.totalFares + f2.totalFares),
+                        new AddWindowInfoProcessor());
 
-        // the results should be sent to the sink that was passed in
-        // (otherwise the tests won't work)
-        // you can end the pipeline with something like this:
+        // compute max driver fares per hour
+        DataStream<DriverFaresByHour> maxDriverFaresByHour = driverFaresByHour
+                .windowAll(TumblingEventTimeWindows.of(Time.hours(1)))
+                .maxBy("totalFares");
 
-        // DataStream<Tuple3<Long, Long, Float>> hourlyMax = ...
-        // hourlyMax.addSink(sink);
+        // send output to sink in the required Tuple format
+        maxDriverFaresByHour
+                .map(driverFares -> Tuple3.of(driverFares.endWindow, driverFares.driverId, driverFares.totalFares))
+                .returns(Types.TUPLE(Types.LONG, Types.LONG, Types.FLOAT))
+                .addSink(sink);
 
-        // execute the pipeline and return the result
         return env.execute("Hourly Tips");
     }
+
+    public static final class AddWindowInfoProcessor extends
+            ProcessWindowFunction<DriverFaresByHour, DriverFaresByHour, Long, TimeWindow> {
+
+        @Override
+        public void process(Long key, Context context, Iterable<DriverFaresByHour> elements,
+                            Collector<DriverFaresByHour> out) {
+            DriverFaresByHour driverFaresByHour = elements.iterator().next();
+            out.collect(new DriverFaresByHour(driverFaresByHour.driverId, driverFaresByHour.totalFares,
+                    context.window().getEnd()));
+        }
+    }
+
 }
