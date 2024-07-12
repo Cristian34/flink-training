@@ -102,8 +102,8 @@ public class RidesAndFaresExercise {
     public static class EnrichmentFunction
             extends RichCoFlatMapFunction<TaxiRide, TaxiFare, RideAndFare> {
 
-        private ValueState<TaxiRide> rideState;
-        private ValueState<TaxiFare> fareState;
+        private transient ValueState<TaxiRide> rideState;
+        private transient ValueState<TaxiFare> fareState;
 
         @Override
         public void open(Configuration config) {

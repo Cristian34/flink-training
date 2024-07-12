@@ -47,6 +47,9 @@ import java.time.Duration;
 public class LongRidesExercise {
 
     private static final long MAX_DURATION_MS = 2 * 3600 * 1000;
+    private static final long MAX_EVENT_DELAY_SECONDS = 60;
+    // define a safety margin to add to timers to protect against time race conditions
+    private static final long SAFETY_MARGIN_MS = 60 * 1000;
 
     private final SourceFunction<TaxiRide> source;
     private final SinkFunction<Long> sink;
@@ -73,7 +76,7 @@ public class LongRidesExercise {
 
         // the WatermarkStrategy specifies how to extract timestamps and generate watermarks
         WatermarkStrategy<TaxiRide> watermarkStrategy =
-                WatermarkStrategy.<TaxiRide>forBoundedOutOfOrderness(Duration.ofSeconds(60))
+                WatermarkStrategy.<TaxiRide>forBoundedOutOfOrderness(Duration.ofSeconds(MAX_EVENT_DELAY_SECONDS))
                         .withTimestampAssigner(
                                 (ride, streamRecordTimestamp) -> ride.getEventTimeMillis());
 
@@ -104,12 +107,16 @@ public class LongRidesExercise {
         // register the ride START or END event (whichever comes first)
         // this implementation assumes that there are no event duplicates
         // (we can have at maximum a START and an END event)
-        private ValueState<TaxiRide> registeredRide;
+        private transient ValueState<TaxiRide> registeredRide;
+        // store the timer timestamp for cleaning idle state (if the corresponding event doesn't arrive)
+        private transient ValueState<Long> idleStateTimer;
 
         @Override
         public void open(Configuration config) {
             registeredRide = getRuntimeContext()
                     .getState(new ValueStateDescriptor<>("registeredEvent", TaxiRide.class));
+            idleStateTimer = getRuntimeContext()
+                    .getState(new ValueStateDescriptor<>("idleStateTimer", Long.class));
         }
 
         @Override
@@ -125,8 +132,14 @@ public class LongRidesExercise {
                         out.collect(ride.rideId);
                         registeredRide.clear();
                     }
+                    // delete "idle state" timer in case it has been set
+                    if (idleStateTimer.value() != null) {
+                        timerService.deleteEventTimeTimer(idleStateTimer.value());
+                        idleStateTimer.clear();
+                    }
                 } else { // if no END event registered yet, register START event and timer
                     registeredRide.update(ride);
+                    // register "long duration" timer
                     timerService.registerEventTimeTimer(ride.getEventTimeMillis() + MAX_DURATION_MS);
                 }
             } else {
@@ -138,17 +151,32 @@ public class LongRidesExercise {
                     timerService.deleteEventTimeTimer(registeredRide.value().getEventTimeMillis() + MAX_DURATION_MS);
                     registeredRide.clear();
                 } else {
-                    // if END event comes before the start event, we don't set a timer, since it will be
-                    // logically strange (time should go forward); in this case, long ride detection will be done
-                    // through a regular check
+                    // if END event comes before the start event or the START event was dismissed (being late),
+                    // we don't set a timer, since it will be logically strange (time should go forward); in this case,
+                    // long ride detection will be done through a regular check
                     registeredRide.update(ride);
+                    // register "idle state" expiration timer for the situations:
+                    //  - the START event is late and not processed
+                    //  - the END event comes after the "long ride" timer fires
+                    // Obs: we don't need to use the "idle state" expiration timer for START events since state
+                    // will be clean up by the "long ride" timer if the END event is missing
+                    idleStateTimer.update(ride.getEventTimeMillis() + MAX_EVENT_DELAY_SECONDS * 1000
+                            + SAFETY_MARGIN_MS);
+                    timerService.registerEventTimeTimer(idleStateTimer.value());
                 }
             }
         }
 
         public void onTimer(long timestamp, OnTimerContext context, Collector<Long> out)
                 throws Exception {
-            out.collect(registeredRide.value().rideId);
+
+            if (idleStateTimer.value() != null) {
+                // "idle state" timer
+                idleStateTimer.clear();
+            } else {
+                // "long ride" timer
+                out.collect(registeredRide.value().rideId);
+            }
             registeredRide.clear();
         }
 
